@@ -41,7 +41,7 @@ export default async function handler(req: any, res: any) {
 
     // 2) Calling Apex REST to check access
     const apexUrl = `${process.env.SF_DOMAIN}/services/apexrest/CheckAgentforceAccess/${encodeURIComponent(
-      externalId
+      integrationId
     )}`;
     const apexResp = await fetch(apexUrl, {
       headers: {
