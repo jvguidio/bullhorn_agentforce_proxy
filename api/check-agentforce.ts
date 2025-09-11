@@ -1,16 +1,15 @@
 // /api/check-agentforce.ts  (Vercel Serverless Function)
 // -----------------------------------------------------------------------------
 // Environment variables (Vercel → Settings → Environment Variables):
-// SF_DOMAIN=https://bullhorn--uat.sandbox.my.salesforce.com     // Org (Apex REST host)
-// SF_TOKEN_HOST=https://bullhorn--uat.sandbox.my.salesforce.com // My Domain used for OAuth token POST
-// SF_CLIENT_ID=...                                              // Connected App consumer key
-// SF_CLIENT_SECRET=...                                          // Connected App consumer secret
-// ALLOWED_ORIGIN=https://jvguidio.github.io                     // CORS allowlist for your front-end
+// SF_DOMAIN=https://bullhorn--uat.sandbox.my.salesforce.com // My Domain (used for OAuth + Apex REST)
+// SF_CLIENT_ID=...                                          // Connected App consumer key
+// SF_CLIENT_SECRET=...                                      // Connected App consumer secret
+// ALLOWED_ORIGIN=https://jvguidio.github.io                 // CORS allowlist for your front-end
 // -----------------------------------------------------------------------------
 //
 // What this function does:
 // 1) Receives a GET with ?integrationId=... from your web page.
-// 2) Gets an OAuth access token via OAuth 2.0 Client Credentials (posts to My Domain).
+// 2) Gets an OAuth access token via OAuth 2.0 Client Credentials (POST to SF_DOMAIN).
 //    - The token is cached in memory to avoid hitting Salesforce login limits.
 //    - Transient token errors are retried with small jitter.
 // 3) Calls an Apex REST endpoint (CheckAgentforceAccess/{integrationId}).
@@ -29,16 +28,15 @@ const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 
 /**
  * Fetch a new Salesforce OAuth token using the Client Credentials flow.
- * - Posts to My Domain (`SF_TOKEN_HOST`) or falls back to `SF_DOMAIN`.
+ * - Posts to `${SF_DOMAIN}/services/oauth2/token`.
  * - Retries a few times with jitter on transient 400s (e.g., login rate exceeded).
  * - Stores the token in the in-memory cache.
  */
 async function fetchSfToken(): Promise<TokenCache> {
-  const loginHost =
-    (process.env.SF_TOKEN_HOST || process.env.SF_DOMAIN || '').replace(/\/+$/, '');
-  if (!loginHost) throw new Error('token_error missing SF_TOKEN_HOST/SF_DOMAIN');
+  const domain = (process.env.SF_DOMAIN || '').replace(/\/+$/, '');
+  if (!domain) throw new Error('token_error missing SF_DOMAIN');
 
-  const url = `${loginHost}/services/oauth2/token`;
+  const url = `${domain}/services/oauth2/token`;
   const body = new URLSearchParams({
     grant_type: 'client_credentials',
     client_id: process.env.SF_CLIENT_ID || '',
@@ -134,7 +132,11 @@ async function callApexWithAutoRefresh(integrationId: string) {
 }
 
 export default async function handler(req: any, res: any) {
-  // ----- CORS (lock down to your site)
+  // ----- CORS (locked to your site; require the env var)
+  if (!process.env.ALLOWED_ORIGIN) {
+    // Fail fast to avoid accidentally exposing the endpoint cross-origin
+    return res.status(500).json({ error: 'server_error', detail: 'Missing ALLOWED_ORIGIN env var' });
+  }
   const allowedOrigin = process.env.ALLOWED_ORIGIN;
   res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
