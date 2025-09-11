@@ -1,19 +1,19 @@
-// /api/check-agentforce.ts (Vercel)
+// /api/check-agentforce.ts (Vercel - Serverless Function)
 // Env vars (Vercel → Settings → Environment Variables):
 // SF_DOMAIN=https://bullhorn--uat.sandbox.my.salesforce.com
-// SF_LOGIN_HOST=https://test.salesforce.com
+// SF_TOKEN_HOST=https://bullhorn--uat.sandbox.my.salesforce.com  // My Domain (token host)
 // SF_CLIENT_ID=...
 // SF_CLIENT_SECRET=...
 // ALLOWED_ORIGIN=https://jvguidio.github.io
-// REDIS_URL=... (opcional; Upstash Redis)
+// REDIS_URL=... (opcional; Upstash Redis HTTP API ou equivalente)
 
 type ApexWrapper = { isAgentforceUser: boolean; userId: string | null };
 
-// ===== Token cache (mem) =====
+// ===== Cache de token (memória) =====
 type TokenCache = { access_token: string; instance_url?: string; fetched_at: number };
 let memToken: TokenCache | null = null;
 
-// ===== Redis opcional =====
+// ===== Redis opcional (HTTP API simples) =====
 async function readRedis(key: string): Promise<TokenCache | null> {
   if (!process.env.REDIS_URL) return null;
   try {
@@ -21,9 +21,11 @@ async function readRedis(key: string): Promise<TokenCache | null> {
     if (!r.ok) return null;
     const data = await r.json().catch(() => null);
     return data as TokenCache | null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
-async function writeRedis(key: string, val: TokenCache, ttlSec = 3600): Promise<void> {
+async function writeRedis(key: string, val: TokenCache, ttlSec = 45 * 60): Promise<void> {
   if (!process.env.REDIS_URL) return;
   try {
     await fetch(`${process.env.REDIS_URL}/set/${encodeURIComponent(key)}`, {
@@ -31,17 +33,25 @@ async function writeRedis(key: string, val: TokenCache, ttlSec = 3600): Promise<
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ value: val, EX: ttlSec })
     });
-  } catch { /* noop */ }
+  } catch {
+    // noop
+  }
 }
 
 const TOKEN_KEY = 'sf:client_credentials:uat';
-
-// Pequeno helper de espera
 const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 
 async function fetchSfToken(): Promise<TokenCache> {
-  const loginHost = process.env.SF_LOGIN_HOST || 'https://test.salesforce.com'; // sandbox por padrão
-  const url = `${loginHost}/services/oauth2/token`;
+  const loginHost =
+    process.env.SF_TOKEN_HOST?.trim() ||
+    process.env.SF_DOMAIN?.trim() || // fallback seguro: usar My Domain da org
+    '';
+
+  if (!loginHost) {
+    throw new Error('token_error missing SF_TOKEN_HOST/SF_DOMAIN');
+  }
+
+  const url = `${loginHost.replace(/\/+$/, '')}/services/oauth2/token`;
   const body = new URLSearchParams({
     grant_type: 'client_credentials',
     client_id: process.env.SF_CLIENT_ID || '',
@@ -52,7 +62,10 @@ async function fetchSfToken(): Promise<TokenCache> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const resp = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'agentforce-proxy/1.0' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'agentforce-proxy/1.0'
+      },
       body
     });
 
@@ -63,16 +76,18 @@ async function fetchSfToken(): Promise<TokenCache> {
         instance_url: js.instance_url,
         fetched_at: Date.now()
       };
-      // guarda em memória e Redis (TTL conservador de 45min para reduzir logins)
       memToken = token;
-      await writeRedis(TOKEN_KEY, token, 45 * 60);
+      await writeRedis(TOKEN_KEY, token, 45 * 60); // TTL conservador (45 min)
       return token;
     }
 
     lastTxt = await resp.text().catch(() => '');
-    // throttling/transiente — faça backoff curto com jitter
-    if (resp.status === 400 && /invalid_grant|login rate exceeded/i.test(lastTxt)) {
-      await sleep(300 + Math.floor(Math.random() * 400));
+    // Erros transitórios: invalid_grant/login rate exceeded/request not supported on this domain (pode haver propagação de DNS/políticas)
+    if (
+      resp.status === 400 &&
+      /invalid_grant|login rate exceeded|request not supported on this domain/i.test(lastTxt)
+    ) {
+      await sleep(300 + Math.floor(Math.random() * 400)); // backoff curto com jitter
       continue;
     }
     break; // outros erros não costumam resolver com retry
@@ -80,24 +95,24 @@ async function fetchSfToken(): Promise<TokenCache> {
   throw new Error(`token_error ${lastTxt}`);
 }
 
-// Lê token do cache (Redis → memória) ou busca um novo
 async function getSfToken(): Promise<string> {
-  // 1) Redis
+  // 1) Redis → 2) memória → 3) buscar novo
   const fromRedis = await readRedis(TOKEN_KEY);
   if (fromRedis?.access_token) {
     memToken = fromRedis;
     return fromRedis.access_token;
   }
-  // 2) Memória
   if (memToken?.access_token) return memToken.access_token;
-  // 3) Buscar novo
   const t = await fetchSfToken();
   return t.access_token;
 }
 
-// Chama Apex; se 401, renova token e tenta de novo 1x
+// Chamada ao Apex com auto-refresh se 401/INVALID_SESSION_ID
 async function callApexWithAutoRefresh(integrationId: string) {
-  const apexUrl = `${process.env.SF_DOMAIN}/services/apexrest/CheckAgentforceAccess/${encodeURIComponent(integrationId)}`;
+  const apexUrl = `${(process.env.SF_DOMAIN || '').replace(
+    /\/+$/,
+    ''
+  )}/services/apexrest/CheckAgentforceAccess/${encodeURIComponent(integrationId)}`;
 
   let token = await getSfToken();
   let resp = await fetch(apexUrl, {
@@ -109,9 +124,9 @@ async function callApexWithAutoRefresh(integrationId: string) {
   });
 
   if (resp.status === 401) {
-    // INVALID_SESSION_ID: renova e tenta novamente uma vez
-    await sleep(150); // micro backoff
-    await fetchSfToken(); // força refresh
+    // sessão inválida/expirada → força refresh e tenta novamente 1x
+    await sleep(150);
+    await fetchSfToken();
     token = await getSfToken();
     resp = await fetch(apexUrl, {
       headers: {
@@ -121,6 +136,7 @@ async function callApexWithAutoRefresh(integrationId: string) {
       }
     });
   }
+
   return resp;
 }
 
@@ -134,21 +150,27 @@ export default async function handler(req: any, res: any) {
 
   try {
     const integrationId = String(req.query.integrationId || '').trim();
-    if (!integrationId) return res.status(400).json({ error: 'missing_integrationId' });
+    if (!integrationId) {
+      return res.status(400).json({ error: 'missing_integrationId' });
+    }
 
-    // (Opcional) headers para ajudar caching intermediário (ajuste conforme necessário)
+    // Cache de CDN/edge (ajuste s-maxage conforme seu caso)
     res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=30');
 
-    // 1) Chama Apex com auto-refresh de token sob 401
+    // 1) Chama Apex (auto-refresh de token sob 401)
     const apexResp = await callApexWithAutoRefresh(integrationId);
 
     if (!apexResp.ok) {
       const errText = await apexResp.text().catch(() => '');
-      return res.status(502).json({ error: 'apex_error', status: apexResp.status, detail: errText });
+      return res
+        .status(502)
+        .json({ error: 'apex_error', status: apexResp.status, detail: errText });
     }
 
     const data = (await apexResp.json()) as ApexWrapper;
-    const allowed = typeof data?.isAgentforceUser === 'boolean' ? data.isAgentforceUser : false;
+
+    const allowed =
+      typeof data?.isAgentforceUser === 'boolean' ? data.isAgentforceUser : false;
     const userId = data && 'userId' in data ? (data.userId ?? null) : null;
 
     return res.status(200).json({ allowed, userId, status: apexResp.status });
